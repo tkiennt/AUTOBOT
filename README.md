@@ -101,4 +101,4 @@ dotnet run --project AutoWashPro.API
 ## 👥 Tác giả & Đóng góp (Credits)
 
 - **Dự án:** Hệ thống quản lý tiệm rửa xe máy thông minh AutoWash Pro.
-- **Thực hiện:** Trung Kiên ([@tkiennt](https://github.com/tkiennt)) — Rà soát mã nguồn, kiểm tra kiến trúc API, đồng bộ và chuẩn hóa tài liệu dự án.
+- **Thành viên đóng góp:** Trung Kiên ([@tkiennt](https://github.com/tkiennt)) — Rà soát mã nguồn, kiểm tra kiến trúc API, đồng bộ và chuẩn hóa tài liệu dự án.
