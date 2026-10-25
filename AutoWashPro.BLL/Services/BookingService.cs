@@ -16,20 +16,25 @@ public class BookingService(
     ILogger<BookingService> logger) : IBookingService
 {
     private const int MaxPageSize = 100;
+    private static readonly TimeOnly BusinessStartTime = new(8, 0);
+    private static readonly TimeOnly BusinessLastCustomerSlot = new(17, 0);
+    private static readonly TimeOnly BusinessEndTime = new(17, 30);
+    private static readonly TimeZoneInfo BusinessTimeZone = ResolveBusinessTimeZone();
     private readonly AppDbContext _db = db;
     private readonly IConfiguration _configuration = configuration;
     private readonly ILogger<BookingService> _logger = logger;
     private readonly int _slotDurationMinutes = configuration.GetValue("BookingSettings:SlotDurationMinutes", 30);
     private readonly int _maxCapacityPerSlot = configuration.GetValue("BookingSettings:MaxCapacityPerSlot", 4);
 
-    public async Task<Result<bool>> CheckSlotAvailabilityAsync(DateTime scheduledAt, Guid pricingId)
+    public async Task<Result<bool>> CheckSlotAvailabilityAsync(Guid customerId, DateTime scheduledAt, Guid pricingId)
     {
-        var pricing = await GetActivePricingAsync(pricingId);
-        if (pricing is null)
+        var validation = await ValidateCustomerScheduleAsync(customerId, pricingId, scheduledAt);
+        if (!validation.IsSuccess)
         {
-            return Result<bool>.Fail("Active pricing was not found.");
+            return Result<bool>.Fail(validation.Error!);
         }
 
+        var pricing = validation.Value!.Pricing;
         var slotStart = scheduledAt.RoundDownToSlot(_slotDurationMinutes);
         var slotEnd = slotStart.AddMinutes(pricing.DurationMinutes);
 
@@ -40,8 +45,14 @@ public class BookingService(
         return Result<bool>.Ok(isAvailable);
     }
 
-    public async Task<Result<IReadOnlyList<AvailabilitySlotDto>>> GetAvailabilityAsync(DateTime date, Guid pricingId)
+    public async Task<Result<IReadOnlyList<AvailabilitySlotDto>>> GetAvailabilityAsync(Guid customerId, DateTime date, Guid pricingId)
     {
+        var customerValidation = await ValidateCustomerBookingDateAsync(customerId, date);
+        if (!customerValidation.IsSuccess)
+        {
+            return Result<IReadOnlyList<AvailabilitySlotDto>>.Fail(customerValidation.Error!);
+        }
+
         var pricing = await GetActivePricingAsync(pricingId);
         if (pricing is null)
         {
@@ -50,14 +61,31 @@ public class BookingService(
 
         var dayStart = date.Date;
         var dayEnd = dayStart.AddDays(1);
-        var nowSlot = DateTime.UtcNow.RoundDownToSlot(_slotDurationMinutes);
+        var nowSlot = GetBusinessNow().RoundDownToSlot(_slotDurationMinutes);
         var slots = new List<AvailabilitySlotDto>();
 
+        // Fetch the whole day's overlapping bookings once, then compute every slot's
+        // capacity in memory (previously one COUNT query per sub-slot per slot).
         await using var tx = await _db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        var fetchEnd = dayEnd.AddMinutes(pricing.DurationMinutes);
+        var dayBookings = await _db.Bookings
+            .Where(booking =>
+                booking.Status != BookingStatus.Cancelled
+                && booking.ScheduledAt < fetchEnd
+                && booking.ExpectedEndAt > dayStart)
+            .Select(booking => new BookingInterval(booking.ScheduledAt, booking.ExpectedEndAt))
+            .ToListAsync();
+        await tx.CommitAsync();
+
         for (var slotStart = dayStart; slotStart < dayEnd; slotStart = slotStart.AddMinutes(_slotDurationMinutes))
         {
             var slotEnd = slotStart.AddMinutes(pricing.DurationMinutes);
-            var remaining = await GetRemainingCapacityAsync(slotStart, slotEnd);
+            if (!IsCustomerBookableRange(slotStart, slotEnd))
+            {
+                continue;
+            }
+
+            var remaining = Math.Max(0, _maxCapacityPerSlot - MaxConcurrency(dayBookings, slotStart, slotEnd));
             var isInFuture = slotStart >= nowSlot;
             slots.Add(new AvailabilitySlotDto
             {
@@ -68,7 +96,6 @@ public class BookingService(
             });
         }
 
-        await tx.CommitAsync();
         return Result<IReadOnlyList<AvailabilitySlotDto>>.Ok(slots);
     }
 
@@ -131,7 +158,7 @@ public class BookingService(
             return Result<BookingResponseDto>.Fail("System user was not found.");
         }
 
-        var scheduledAt = DateTime.UtcNow.RoundDownToSlot(_slotDurationMinutes);
+        var scheduledAt = GetBusinessNow().RoundDownToSlot(_slotDurationMinutes);
         var expectedEndAt = scheduledAt.AddMinutes(pricing.DurationMinutes);
 
         var phone = request.WalkinPhone.Trim();
@@ -198,7 +225,7 @@ public class BookingService(
             return Result<bool>.Fail("Only confirmed bookings can be cancelled.");
         }
 
-        if (booking.ScheduledAt <= DateTime.UtcNow)
+        if (booking.ScheduledAt <= GetBusinessNow())
         {
             return Result<bool>.Fail("Past or active bookings cannot be cancelled.");
         }
@@ -217,10 +244,13 @@ public class BookingService(
             .AsNoTracking()
             .Include(booking => booking.Pricing)
             .ThenInclude(pricing => pricing.Service)
+            .Include(booking => booking.Pricing)
+            .ThenInclude(pricing => pricing.VehicleType)
             .Where(booking => booking.CustomerId == customerId)
             .OrderByDescending(booking => booking.ScheduledAt);
 
-        return Result<PagedResultDto<BookingResponseDto>>.Ok(await ToPagedResultAsync(query, page, pageSize));
+        return Result<PagedResultDto<BookingResponseDto>>.Ok(
+            await query.ToPagedResultAsync(page, pageSize, ToBookingResponseDto));
     }
 
     public async Task<Result<PagedResultDto<BookingResponseDto>>> GetAdminBookingsAsync(
@@ -234,6 +264,8 @@ public class BookingService(
             .AsNoTracking()
             .Include(booking => booking.Pricing)
             .ThenInclude(pricing => pricing.Service)
+            .Include(booking => booking.Pricing)
+            .ThenInclude(pricing => pricing.VehicleType)
             .AsQueryable();
 
         if (date.HasValue)
@@ -254,7 +286,8 @@ public class BookingService(
         }
 
         query = query.OrderByDescending(booking => booking.ScheduledAt);
-        return Result<PagedResultDto<BookingResponseDto>>.Ok(await ToPagedResultAsync(query, page, pageSize));
+        return Result<PagedResultDto<BookingResponseDto>>.Ok(
+            await query.ToPagedResultAsync(page, pageSize, ToBookingResponseDto));
     }
 
     public async Task<Result<PagedResultDto<BookingResponseDto>>> GetDailyQueueAsync(DateOnly date, int page, int pageSize)
@@ -270,6 +303,8 @@ public class BookingService(
             .ThenInclude(customer => customer!.TierConfig)
             .Include(booking => booking.Pricing)
             .ThenInclude(pricing => pricing.Service)
+            .Include(booking => booking.Pricing)
+            .ThenInclude(pricing => pricing.VehicleType)
             .Where(booking =>
                 booking.ScheduledAt >= dayStart
                 && booking.ScheduledAt < dayEnd
@@ -315,11 +350,17 @@ public class BookingService(
             return Result<(ServicePricing, Customer)>.Fail("Customer was not found.");
         }
 
-        var vehicleBelongsToCustomer = await _db.Vehicles.AnyAsync(vehicle =>
-            vehicle.VehicleId == request.VehicleId && vehicle.CustomerId == customerId);
-        if (!vehicleBelongsToCustomer)
+        var vehicle = await _db.Vehicles
+            .AsNoTracking()
+            .SingleOrDefaultAsync(entity => entity.VehicleId == request.VehicleId && entity.CustomerId == customerId);
+        if (vehicle is null)
         {
             return Result<(ServicePricing, Customer)>.Fail("Vehicle was not found for this customer.");
+        }
+
+        if (vehicle.VehicleTypeId != pricing.VehicleTypeId)
+        {
+            return Result<(ServicePricing, Customer)>.Fail("Selected service package does not match the vehicle type.");
         }
 
         var expectedEndAt = scheduledAt.AddMinutes(pricing.DurationMinutes);
@@ -333,13 +374,18 @@ public class BookingService(
             return Result<(ServicePricing, Customer)>.Fail("Xe này đã có lịch đặt trùng giờ. Vui lòng chọn giờ khác.");
         }
 
-        var nowSlot = DateTime.UtcNow.RoundDownToSlot(_slotDurationMinutes);
+        var nowSlot = GetBusinessNow().RoundDownToSlot(_slotDurationMinutes);
         if (scheduledAt < nowSlot)
         {
             return Result<(ServicePricing, Customer)>.Fail("Scheduled time must be in the future.");
         }
 
-        if (scheduledAt > DateTime.UtcNow.AddDays(customer.TierConfig.BookingWindowDays))
+        if (!IsCustomerBookableRange(scheduledAt, expectedEndAt))
+        {
+            return Result<(ServicePricing, Customer)>.Fail("Bookings are only available from 08:00 to 17:30 within business hours.");
+        }
+
+        if (DateOnly.FromDateTime(scheduledAt) > GetBookingWindowEndDate(customer.TierConfig.BookingWindowDays))
         {
             return Result<(ServicePricing, Customer)>.Fail("Scheduled time exceeds the customer's booking window.");
         }
@@ -352,10 +398,78 @@ public class BookingService(
         return Result<(ServicePricing, Customer)>.Ok((pricing, customer));
     }
 
+    private async Task<Result<(ServicePricing Pricing, Customer Customer)>> ValidateCustomerScheduleAsync(
+        Guid customerId,
+        Guid pricingId,
+        DateTime scheduledAt)
+    {
+        var pricing = await GetActivePricingAsync(pricingId);
+        if (pricing is null)
+        {
+            return Result<(ServicePricing, Customer)>.Fail("Active pricing was not found.");
+        }
+
+        var customer = await _db.Customers
+            .AsNoTracking()
+            .Include(entity => entity.TierConfig)
+            .SingleOrDefaultAsync(entity => entity.CustomerId == customerId);
+        if (customer is null)
+        {
+            return Result<(ServicePricing, Customer)>.Fail("Customer was not found.");
+        }
+
+        var slotStart = scheduledAt.RoundDownToSlot(_slotDurationMinutes);
+        var nowSlot = GetBusinessNow().RoundDownToSlot(_slotDurationMinutes);
+        if (slotStart < nowSlot)
+        {
+            return Result<(ServicePricing, Customer)>.Fail("Scheduled time must be in the future.");
+        }
+
+        var slotEnd = slotStart.AddMinutes(pricing.DurationMinutes);
+        if (!IsCustomerBookableRange(slotStart, slotEnd))
+        {
+            return Result<(ServicePricing, Customer)>.Fail("Bookings are only available from 08:00 to 17:30 within business hours.");
+        }
+
+        if (DateOnly.FromDateTime(slotStart) > GetBookingWindowEndDate(customer.TierConfig.BookingWindowDays))
+        {
+            return Result<(ServicePricing, Customer)>.Fail("Scheduled time exceeds the customer's booking window.");
+        }
+
+        return Result<(ServicePricing, Customer)>.Ok((pricing, customer));
+    }
+
+    private async Task<Result<Customer>> ValidateCustomerBookingDateAsync(Guid customerId, DateTime date)
+    {
+        var customer = await _db.Customers
+            .AsNoTracking()
+            .Include(entity => entity.TierConfig)
+            .SingleOrDefaultAsync(entity => entity.CustomerId == customerId);
+        if (customer is null)
+        {
+            return Result<Customer>.Fail("Customer was not found.");
+        }
+
+        var bookingDate = DateOnly.FromDateTime(date);
+        var today = GetBusinessToday();
+        if (bookingDate < today)
+        {
+            return Result<Customer>.Fail("Scheduled time must be in the future.");
+        }
+
+        if (bookingDate > GetBookingWindowEndDate(customer.TierConfig.BookingWindowDays))
+        {
+            return Result<Customer>.Fail("Scheduled time exceeds the customer's booking window.");
+        }
+
+        return Result<Customer>.Ok(customer);
+    }
+
     private async Task<ServicePricing?> GetActivePricingAsync(Guid pricingId)
     {
         return await _db.ServicePricings
             .Include(pricing => pricing.Service)
+            .Include(pricing => pricing.VehicleType)
             .SingleOrDefaultAsync(pricing =>
                 pricing.PricingId == pricingId
                 && pricing.IsActive
@@ -377,60 +491,79 @@ public class BookingService(
 
     private async Task<bool> IsRangeAvailableAsync(DateTime scheduledAt, DateTime expectedEndAt)
     {
-        var maxConcurrentBookings = 0;
-        for (var slotStart = scheduledAt; slotStart < expectedEndAt; slotStart = slotStart.AddMinutes(_slotDurationMinutes))
-        {
-            var slotEnd = slotStart.AddMinutes(_slotDurationMinutes);
-            var overlappingBookings = await CountOverlappingBookingsAsync(slotStart, slotEnd);
-            maxConcurrentBookings = Math.Max(maxConcurrentBookings, overlappingBookings);
-        }
-
-        return maxConcurrentBookings < _maxCapacityPerSlot;
-    }
-
-    private async Task<int> GetRemainingCapacityAsync(DateTime scheduledAt, DateTime expectedEndAt)
-    {
-        var minimumRemainingCapacity = _maxCapacityPerSlot;
-        for (var slotStart = scheduledAt; slotStart < expectedEndAt; slotStart = slotStart.AddMinutes(_slotDurationMinutes))
-        {
-            var slotEnd = slotStart.AddMinutes(_slotDurationMinutes);
-            var overlappingBookings = await CountOverlappingBookingsAsync(slotStart, slotEnd);
-            minimumRemainingCapacity = Math.Min(minimumRemainingCapacity, _maxCapacityPerSlot - overlappingBookings);
-        }
-
-        return Math.Max(0, minimumRemainingCapacity);
-    }
-
-    private async Task<int> CountOverlappingBookingsAsync(DateTime slotStart, DateTime slotEnd)
-    {
-        return await _db.Bookings.CountAsync(booking =>
-            booking.Status != BookingStatus.Cancelled
-            && booking.ScheduledAt < slotEnd
-            && booking.ExpectedEndAt > slotStart);
-    }
-
-    private static async Task<PagedResultDto<BookingResponseDto>> ToPagedResultAsync(
-        IQueryable<Booking> query,
-        int page,
-        int pageSize)
-    {
-        page = Math.Max(1, page);
-        pageSize = Math.Clamp(pageSize, 1, MaxPageSize);
-
-        var totalCount = await query.CountAsync();
-        var items = await query
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .Select(booking => ToBookingResponseDto(booking))
+        // Single query: fetch all non-cancelled bookings overlapping the requested range,
+        // then evaluate per-sub-slot concurrency in memory (BR-01).
+        var overlapping = await _db.Bookings
+            .Where(booking =>
+                booking.Status != BookingStatus.Cancelled
+                && booking.ScheduledAt < expectedEndAt
+                && booking.ExpectedEndAt > scheduledAt)
+            .Select(booking => new BookingInterval(booking.ScheduledAt, booking.ExpectedEndAt))
             .ToListAsync();
 
-        return new PagedResultDto<BookingResponseDto>
+        return MaxConcurrency(overlapping, scheduledAt, expectedEndAt) < _maxCapacityPerSlot;
+    }
+
+    // Maximum number of bookings concurrently occupying any 30-min sub-slot of [rangeStart, rangeEnd).
+    private int MaxConcurrency(IReadOnlyList<BookingInterval> bookings, DateTime rangeStart, DateTime rangeEnd)
+    {
+        var max = 0;
+        for (var slotStart = rangeStart; slotStart < rangeEnd; slotStart = slotStart.AddMinutes(_slotDurationMinutes))
         {
-            Items = items,
-            Page = page,
-            PageSize = pageSize,
-            TotalCount = totalCount
-        };
+            var slotEnd = slotStart.AddMinutes(_slotDurationMinutes);
+            var concurrent = bookings.Count(b => b.ScheduledAt < slotEnd && b.ExpectedEndAt > slotStart);
+            if (concurrent > max)
+            {
+                max = concurrent;
+            }
+        }
+
+        return max;
+    }
+
+    private readonly record struct BookingInterval(DateTime ScheduledAt, DateTime ExpectedEndAt);
+
+    private static bool IsCustomerBookableRange(DateTime scheduledAt, DateTime expectedEndAt)
+    {
+        var startTime = TimeOnly.FromDateTime(scheduledAt);
+        var endTime = TimeOnly.FromDateTime(expectedEndAt);
+        return startTime >= BusinessStartTime
+            && startTime <= BusinessLastCustomerSlot
+            && endTime <= BusinessEndTime;
+    }
+
+    private static DateOnly GetBookingWindowEndDate(int bookingWindowDays)
+    {
+        return GetBusinessToday().AddDays(Math.Max(0, bookingWindowDays));
+    }
+
+    private static DateTime GetBusinessNow()
+    {
+        return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, BusinessTimeZone);
+    }
+
+    private static DateOnly GetBusinessToday()
+    {
+        return DateOnly.FromDateTime(GetBusinessNow());
+    }
+
+    private static TimeZoneInfo ResolveBusinessTimeZone()
+    {
+        foreach (var timeZoneId in new[] { "SE Asia Standard Time", "Asia/Ho_Chi_Minh" })
+        {
+            try
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
+            }
+            catch (TimeZoneNotFoundException)
+            {
+            }
+            catch (InvalidTimeZoneException)
+            {
+            }
+        }
+
+        return TimeZoneInfo.Local;
     }
 
     private static BookingResponseDto ToBookingResponseDto(Booking booking)
@@ -444,7 +577,7 @@ public class BookingService(
             PromotionId = booking.PromotionId,
             CreatedBy = booking.CreatedBy,
             ServiceName = booking.Pricing.Service.Name,
-            VehicleType = booking.Pricing.VehicleType,
+            VehicleTypeName = booking.Pricing.VehicleType.Name,
             ScheduledAt = booking.ScheduledAt,
             ExpectedEndAt = booking.ExpectedEndAt,
             CompletedAt = booking.CompletedAt,

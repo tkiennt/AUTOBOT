@@ -104,6 +104,8 @@ namespace AutoWashPro.DAL.Data.Migrations
 
                     b.HasIndex("VehicleId");
 
+                    b.HasIndex("ScheduledAt", "Status");
+
                     b.ToTable("Bookings", t =>
                         {
                             t.HasCheckConstraint("CK_Booking_WalkinContact_WhenNoCustomer", "([CustomerId] IS NOT NULL) OR ([WalkinPhone] IS NOT NULL AND [WalkinLicensePlate] IS NOT NULL)");
@@ -290,7 +292,9 @@ namespace AutoWashPro.DAL.Data.Migrations
 
                     b.HasIndex("BookingId");
 
-                    b.HasIndex("CustomerId");
+                    b.HasIndex("ExpiryDate");
+
+                    b.HasIndex("CustomerId", "Type");
 
                     b.ToTable("PointsLedgers");
                 });
@@ -401,14 +405,14 @@ namespace AutoWashPro.DAL.Data.Migrations
                     b.Property<Guid>("ServiceId")
                         .HasColumnType("uniqueidentifier");
 
-                    b.Property<string>("VehicleType")
-                        .IsRequired()
-                        .HasMaxLength(50)
-                        .HasColumnType("nvarchar(50)");
+                    b.Property<Guid>("VehicleTypeId")
+                        .HasColumnType("uniqueidentifier");
 
                     b.HasKey("PricingId");
 
-                    b.HasIndex("ServiceId");
+                    b.HasIndex("VehicleTypeId");
+
+                    b.HasIndex("ServiceId", "VehicleTypeId");
 
                     b.ToTable("ServicePricings", t =>
                         {
@@ -596,10 +600,8 @@ namespace AutoWashPro.DAL.Data.Migrations
                         .HasMaxLength(30)
                         .HasColumnType("nvarchar(30)");
 
-                    b.Property<string>("VehicleType")
-                        .IsRequired()
-                        .HasMaxLength(50)
-                        .HasColumnType("nvarchar(50)");
+                    b.Property<Guid>("VehicleTypeId")
+                        .HasColumnType("uniqueidentifier");
 
                     b.HasKey("VehicleId");
 
@@ -607,6 +609,8 @@ namespace AutoWashPro.DAL.Data.Migrations
 
                     b.HasIndex("LicensePlate")
                         .IsUnique();
+
+                    b.HasIndex("VehicleTypeId");
 
                     b.ToTable("Vehicles");
                 });
@@ -824,7 +828,15 @@ namespace AutoWashPro.DAL.Data.Migrations
                         .OnDelete(DeleteBehavior.NoAction)
                         .IsRequired();
 
+                    b.HasOne("AutoWashPro.DAL.Data.Entities.VehicleType", "VehicleType")
+                        .WithMany()
+                        .HasForeignKey("VehicleTypeId")
+                        .OnDelete(DeleteBehavior.NoAction)
+                        .IsRequired();
+
                     b.Navigation("Service");
+
+                    b.Navigation("VehicleType");
                 });
 
             modelBuilder.Entity("AutoWashPro.DAL.Data.Entities.Vehicle", b =>
@@ -835,7 +847,15 @@ namespace AutoWashPro.DAL.Data.Migrations
                         .OnDelete(DeleteBehavior.NoAction)
                         .IsRequired();
 
+                    b.HasOne("AutoWashPro.DAL.Data.Entities.VehicleType", "VehicleType")
+                        .WithMany()
+                        .HasForeignKey("VehicleTypeId")
+                        .OnDelete(DeleteBehavior.NoAction)
+                        .IsRequired();
+
                     b.Navigation("Customer");
+
+                    b.Navigation("VehicleType");
                 });
 
             modelBuilder.Entity("AutoWashPro.DAL.Data.Entities.Booking", b =>

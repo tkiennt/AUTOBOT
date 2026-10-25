@@ -5,9 +5,9 @@ import { StatusPill } from '../../components/badges.jsx'
 import { Icons } from '../../components/icons.jsx'
 import { StaffShell } from '../../components/layout/StaffShell.jsx'
 import { EmptyState } from '../../components/ui.jsx'
-import { formatDate, formatTime, formatVND } from '../../utils/format.js'
+import { formatDate, formatTime, formatVND, toLocalDateIso } from '../../utils/format.js'
 
-const TODAY = new Date().toISOString().slice(0, 10)
+const TODAY = toLocalDateIso()
 
 export function StaffHistory() {
   const [bookings, setBookings] = useState([])
@@ -97,7 +97,7 @@ export function StaffHistory() {
                   <StatusPill status={b.status?.toLowerCase()} />
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--ink-600)', fontWeight: 500 }}>{b.serviceName}</div>
-                <div style={{ fontSize: 11, color: 'var(--ink-400)', fontFamily: "'Geist Mono',monospace", marginTop: 2 }}>{b.vehicleType}</div>
+                <div style={{ fontSize: 11, color: 'var(--ink-400)', fontFamily: "'Geist Mono',monospace", marginTop: 2 }}>{b.vehicleTypeName}</div>
               </div>
               <div style={{ padding: '12px 16px', textAlign: 'right', flexShrink: 0 }}>
                 <div style={{ fontSize: 14, fontWeight: 800, fontFamily: "'Geist Mono',monospace" }}>{formatVND(b.finalPrice)}</div>
